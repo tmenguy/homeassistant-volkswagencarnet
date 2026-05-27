@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import logging
 from random import randint, random
+import secrets
+import uuid
 from urllib.parse import parse_qs, urljoin, urlparse
 from typing import Dict, Optional
 
@@ -22,8 +24,6 @@ from .vw_const import (
     BASE_API,
     BRAND,
     CLIENT_ID,
-    CLIENT_SCOPE,
-    CLIENT_TOKEN_TYPES,
     COUNTRY,
     HEADERS_AUTH,
     HEADERS_SESSION,
@@ -96,7 +96,7 @@ class Connection:
                 self._session_logged_in = await self._login()
                 if self._session_logged_in:
                     break
-                if i > tries:
+                if i == tries - 1:
                     _LOGGER.error("Login failed after %s tries", tries)
                     return False
                 await asyncio.sleep(random() * 5)
@@ -138,59 +138,6 @@ class Connection:
             )
         return await req.json()
 
-    async def get_authorization_page(self, authorization_endpoint: str) -> str:
-        """Get authorization page (login page)."""
-        # https://identity.vwgroup.io/oidc/v1/authorize?nonce={NONCE}&state={STATE}&response_type={TOKEN_TYPES}&scope={SCOPE}&redirect_uri={APP_URI}&client_id={CLIENT_ID}
-        # https://identity.vwgroup.io/oidc/v1/authorize?client_id={CLIENT_ID}&scope={SCOPE}&response_type={TOKEN_TYPES}&redirect_uri={APP_URI}
-        _LOGGER.debug('Requesting authorization page from "%s"', authorization_endpoint)
-        self._session_auth_headers.pop("Referer", None)
-        self._session_auth_headers.pop("Origin", None)
-        _LOGGER.debug('Request headers: "%s"', self._session_auth_headers)
-
-        try:
-            req = await self._session.get(
-                url=authorization_endpoint,
-                headers=self._session_auth_headers,
-                allow_redirects=False,
-                params={
-                    "redirect_uri": APP_URI,
-                    "response_type": CLIENT_TOKEN_TYPES,
-                    "client_id": CLIENT_ID,
-                    "scope": CLIENT_SCOPE,
-                },
-            )
-
-            # Check if the response contains a redirect location
-            location = req.headers.get("Location")
-            if not location:
-                raise AuthenticationError(
-                    f"Missing 'Location' header in authorization response. Payload returned: {await req.content.read()}"
-                )
-
-            ref = urljoin(authorization_endpoint, location)
-            if "error" in ref:
-                parsed_query = parse_qs(urlparse(ref).query)
-                error_msg = parsed_query.get("error", ["Unknown error"])[0]
-                error_description = parsed_query.get(
-                    "error_description", ["No description"]
-                )[0]
-                _LOGGER.info("Authorization error: %s", error_description)
-                raise AuthenticationError(f"{error_msg}: {error_description}")
-
-            # If redirected, fetch the new location
-            req = await self._session.get(
-                url=ref, headers=self._session_auth_headers, allow_redirects=False
-            )
-
-            if req.status != 200:
-                raise AuthenticationError("Failed to fetch authorization endpoint")
-
-            return await req.text()
-
-        except Exception as e:
-            _LOGGER.warning("Error during fetching authorization page: %s", str(e))
-            raise
-
     def extract_state_token(self, page_content: str) -> Optional[str]:
         """Extract state token from a page."""
         soup = BeautifulSoup(page_content, "html.parser")
@@ -199,52 +146,6 @@ class Connection:
             _LOGGER.debug("State token not found.")
             return None
         return state_input["value"]
-
-    async def post_form(
-        self, session, url: str, headers: dict, form_data: dict, redirect: bool = True
-    ) -> str:
-        """Post a form and check for success."""
-        req = await session.post(
-            url, headers=headers, data=form_data, allow_redirects=redirect
-        )
-
-        # Redirect case
-        if not redirect and req.status == 302:
-            return req.headers.get("Location")
-
-        # Handle explicit error 400 (form validation failure)
-        if req.status == 400:
-            page_content = await req.text()
-            soup = BeautifulSoup(page_content, "html.parser")
-
-            # Try both username + password fields in one pass
-            for field_id in ("error-element-username", "error-element-password"):
-                span = soup.select_one(f'span[id="{field_id}"]')
-                if not span:
-                    continue
-
-                error_code = span.get("data-error-code")
-                if error_code == "wrong-email-credentials":
-                    raise AuthenticationError("Wrong username or password")
-
-            # Unknown 400 error
-            raise AuthenticationError(
-                "Login form validation failed with unknown 400 error"
-            )
-
-        # Any unexpected HTTP code
-        if req.status not in (200, 400):
-            raise RequestError(
-                f"Login form submission failed with HTTP {req.status}. "
-                "This might indicate incorrect credentials or a temporary service issue."
-            )
-
-        # Normal success path
-        return await req.text()
-
-    async def handle_login_with_password(self, session, url, auth_headers, form_data):
-        """Handle login with email and password."""
-        return await self.post_form(session, url, auth_headers, form_data, False)
 
     async def follow_redirects(
         self, session, pw_url: str, redirect_location: str
@@ -259,7 +160,13 @@ class Connection:
                     "This might indicate an authentication loop."
                 )
             response = await session.get(
-                url=ref, headers=self._session_auth_headers, allow_redirects=False
+                url=ref,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive",
+                },
+                allow_redirects=False,
             )
 
             # Check if we hit a terms and conditions page (HTTP 200 with no redirect)
@@ -286,88 +193,157 @@ class Connection:
             max_depth -= 1
         return ref
 
-    async def _get_authorization_code(self, openid_config: dict) -> str:
-        """Get authorization code from login flow.
+    async def _get_authorization_code(self) -> tuple:
+        """Get authorization code and tokens from hybrid login flow."""
+        plain_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+        }
 
-        Args:
-            openid_config: OpenID configuration dictionary containing
-                        authorization_endpoint and issuer
+        # Step 1: Hit VW's authorize preamble endpoint to get Auth0's own state.
+        # CarConnectivity does this instead of generating a random state — the token
+        # exchange endpoint at /user-login/login/v1 validates that the state matches
+        # what Auth0 originally issued, so a self-generated state is always rejected.
+        nonce = secrets.token_hex(16)
+        req = await self._session.get(
+            url=f"{BASE_API}/user-login/v1/authorize",
+            headers=plain_headers,
+            params={"redirect_uri": APP_URI, "nonce": nonce},
+            allow_redirects=False,
+        )
+        if req.status not in (302, 303):
+            body = await req.text()
+            _LOGGER.debug("VW authorize returned %s: %s", req.status, body[:200])
+            raise AuthenticationError(f"VW authorize endpoint returned HTTP {req.status}")
 
-        Returns:
-            Authorization code string
+        location = req.headers.get("Location")
+        if not location:
+            raise AuthenticationError("VW authorize endpoint returned no Location header")
 
-        Raises:
-            AuthenticationError: If authorization fails
-        """
-        # Get OpenID configuration
-        authorization_endpoint = openid_config["authorization_endpoint"]
-        auth_issuer = openid_config["issuer"]
+        # Capture Auth0's state from the redirect URL query params
+        auth0_state = parse_qs(urlparse(location).query).get("state", [None])[0]
+        if not auth0_state:
+            raise AuthenticationError("No state parameter in VW authorize redirect")
+        _LOGGER.debug("Got Auth0 state from preamble redirect")
 
-        # Get authorization page
-        authorization_page = await self.get_authorization_page(authorization_endpoint)
+        # Step 2: Follow the redirect(s) to reach the Auth0 login page
+        login_url = urljoin(f"{BASE_API}/user-login/v1/authorize", location)
+        req = await self._session.get(url=login_url, headers=plain_headers, allow_redirects=False)
+        while req.status in (302, 303):
+            next_loc = req.headers.get("Location")
+            if not next_loc:
+                raise AuthenticationError("Missing Location header during login page redirect")
+            login_url = urljoin(login_url, next_loc)
+            req = await self._session.get(url=login_url, headers=plain_headers, allow_redirects=False)
 
-        # Extract form data
+        if req.status != 200:
+            raise AuthenticationError(f"Failed to fetch Auth0 login page: HTTP {req.status}")
+        authorization_page = await req.text()
+
+        # Step 3: Extract the Auth0 form state token
         state_token = self.extract_state_token(authorization_page)
-
         if not state_token:
             _LOGGER.error(
-                "Unable to find valid login page. "
+                "Unable to find state token in login page. "
                 "Try logging in to the portal: https://www.myvolkswagen.net/"
             )
             raise AuthenticationError("Invalid login page - missing state token")
 
-        # Do login
-        login_form = {
-            "username": self._session_auth_username,
-            "password": self._session_auth_password,
-            "state": state_token,
+        # Step 4: POST credentials — Auth0 rejects VW Android headers here
+        login_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Connection": "keep-alive",
+            "Referer": login_url,
+            "Origin": "https://identity.vwgroup.io",
         }
-        login_url = f"{auth_issuer}/u/login?state={state_token}"
-
-        redirect_location = await self.post_form(
-            self._session,
+        req = await self._session.post(
             login_url,
-            self._session_auth_headers,
-            login_form,
-            False,
+            headers=login_headers,
+            data={"username": self._session_auth_username, "password": self._session_auth_password, "state": state_token},
+            allow_redirects=False,
         )
+        if req.status not in (302, 303):
+            body = await req.text()
+            _LOGGER.debug("Login POST returned %s: %s", req.status, body[:200])
+            raise AuthenticationError(f"Login failed with HTTP {req.status}")
+        redirect_location = req.headers.get("Location")
+        if not redirect_location:
+            raise AuthenticationError("Login POST returned redirect without Location header")
 
-        # Handle redirects and extract tokens
-        redirect_response = await self.follow_redirects(
-            self._session, auth_issuer, redirect_location
-        )
+        # Check for password/throttle errors in redirect params
+        location_params = parse_qs(urlparse(redirect_location).query)
+        error = location_params.get("error", [None])[0]
+        if error == "login.errors.password_invalid":
+            raise AuthenticationError("Wrong password")
+        if error == "login.error.throttled":
+            raise AuthenticationError("Too many failed login attempts - account throttled")
+        if (
+            location_params.get("updated", [None])[0] == "dataprivacy"
+            and "userId" not in location_params
+        ):
+            raise AuthenticationError(
+                "Terms and Conditions must be accepted. "
+                "Please visit https://www.myvolkswagen.net/ to accept the updated terms."
+            )
 
-        jwt_auth_code = parse_qs(urlparse(redirect_response).query)["code"][0]
-        return jwt_auth_code
+        # Step 5: Follow redirects to APP_URI — final URL contains tokens in fragment
+        callback_url = await self.follow_redirects(self._session, login_url, redirect_location)
+
+        # Parse tokens from URL fragment (hybrid flow: code id_token token)
+        parsed = urlparse(callback_url)
+        fragment_params = parse_qs(parsed.fragment)
+        query_params = parse_qs(parsed.query)
+        all_params = {**query_params, **fragment_params}
+
+        auth_code = all_params.get("code", [None])[0]
+        id_token = all_params.get("id_token", [None])[0]
+        access_token = all_params.get("access_token", [None])[0]
+        # Use Auth0's state (echoed back in fragment) for the token exchange
+        state = all_params.get("state", [auth0_state])[0]
+
+        if not auth_code:
+            raise AuthenticationError("No authorization code in callback URL")
+
+        return auth_code, id_token, access_token, state
 
     async def _exchange_code_for_tokens(
-        self, auth_code: str, token_endpoint: str
+        self, auth_code: str, id_token: str, access_token: str, state: str
     ) -> dict:
-        """Exchange authorization code for access tokens.
-
-        Args:
-            auth_code: Authorization code from login flow
-            token_endpoint: Token endpoint URL
-
-        Returns:
-            Dictionary containing tokens
-
-        Raises:
-            AuthenticationError: If token exchange fails
-        """
-        token_body = {
-            "client_id": CLIENT_ID,
-            "grant_type": "authorization_code",
-            "code": auth_code,
+        """Exchange authorization code for session tokens via VW login endpoint."""
+        token_request = {
+            "state": state,
+            "id_token": id_token,
             "redirect_uri": APP_URI,
+            "region": "emea",
+            "access_token": access_token,
+            "authorizationCode": auth_code,
         }
-
-        # Token endpoint
-        token_response = await self.post_form(
-            self._session, token_endpoint, self._session_auth_headers, token_body
+        token_headers = {
+            **self._session_auth_headers,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "weconnect-trace-id": str(uuid.uuid4()),
+        }
+        req = await self._session.post(
+            f"{BASE_API}/user-login/login/v1",
+            headers=token_headers,
+            json=token_request,
         )
+        if req.status != 200:
+            body = await req.text()
+            raise AuthenticationError(f"Token exchange failed with HTTP {req.status}: {body[:200]}")
 
-        return json_loads(token_response)
+        raw = await req.json()
+        # Normalize camelCase keys to snake_case
+        return {
+            "access_token": raw.get("accessToken"),
+            "id_token": raw.get("idToken"),
+            "refresh_token": raw.get("refreshToken"),
+            "token_type": raw.get("tokenType", "Bearer"),
+        }
 
     async def _login(self) -> bool:
         """Login function.
@@ -381,15 +357,11 @@ class Connection:
             self._session_headers = HEADERS_SESSION.copy()
             self._session_auth_headers = HEADERS_AUTH.copy()
 
-            # Get OpenID configuration for token endpoint
-            openid_config = await self.get_openid_config()
-            token_endpoint = openid_config["token_endpoint"]
-
-            # Get authorization code
-            auth_code = await self._get_authorization_code(openid_config)
+            # Get authorization code and tokens from hybrid flow
+            auth_code, id_token, access_token, state = await self._get_authorization_code()
 
             # Exchange code for tokens
-            tokens = await self._exchange_code_for_tokens(auth_code, token_endpoint)
+            tokens = await self._exchange_code_for_tokens(auth_code, id_token, access_token, state)
 
             # Validate token structure
             required_keys = ["access_token", "id_token", "token_type"]
@@ -452,10 +424,10 @@ class Connection:
         self._session_headers.pop("Authorization", None)
 
         if self._session_logged_in:
-            if self._session_headers.get("identity", {}).get("identity_token"):
+            if self._session_tokens.get("identity", {}).get("access_token"):
                 _LOGGER.info("Revoking Identity Access Token")
 
-            if self._session_headers.get("identity", {}).get("refresh_token"):
+            if self._session_tokens.get("identity", {}).get("refresh_token"):
                 _LOGGER.info("Revoking Identity Refresh Token")
                 params = {"token": self._session_tokens["identity"]["refresh_token"]}
                 await self.post(f"{BASE_API}/login/v1/idk/revoke", data=params)

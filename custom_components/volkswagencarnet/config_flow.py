@@ -81,7 +81,6 @@ class VolkswagenCarnetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 session=async_get_clientsession(self.hass),
                 username=self._init_info[CONF_USERNAME],
                 password=self._init_info[CONF_PASSWORD],
-                fulldebug=self._init_info.get(CONF_DEBUG, DEFAULT_DEBUG),
                 country=self._init_info[CONF_REGION],
             )
 

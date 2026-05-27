@@ -1,2 +1,7 @@
 pytz
-volkswagencarnet==5.0.2
+# volkswagencarnet is bundled at custom_components/volkswagencarnet/volkswagencarnet/
+# (see import_volkswagencarnet.sh); only its third-party dependencies are listed
+# here. aiohttp is already provided by Home Assistant core.
+beautifulsoup4
+lxml
+pyjwt

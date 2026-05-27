@@ -26,6 +26,22 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 # pylint: disable=no-name-in-module,hass-relative-import
+# Prefer the volkswagencarnet library bundled at
+# custom_components/volkswagencarnet/volkswagencarnet/ so the integration can be
+# run and tested against a local copy without reinstalling the pip package
+# (fast iteration). The bundled package is exposed under its bare
+# `volkswagencarnet` name so the imports below — and every other integration
+# module — resolve to it. Falls back to an installed copy if the bundle is
+# missing.
+try:
+    from . import volkswagencarnet  # noqa: F401  (bundled copy)
+except ImportError:
+    import volkswagencarnet  # noqa: F401  (installed copy)
+else:
+    import sys
+
+    sys.modules.setdefault("volkswagencarnet", volkswagencarnet)
+
 from volkswagencarnet.vw_connection import Connection
 from volkswagencarnet.vw_dashboard import (
     BinarySensor,

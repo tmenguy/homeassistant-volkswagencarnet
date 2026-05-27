@@ -13,7 +13,8 @@
           "spin": "S-PIN",
           "name": "Nimeä ajoneuvo (oletuksena näytetään VIN)",
           "debug": "Ota täysi API:n debuglogitus käyttöön (logitustaso pitää myös olla asetettu debugille)",
-          "convert": "Käytä etäisyysmuunnoksia"
+          "convert": "Käytä etäisyysmuunnoksia",
+          "scan_interval": "Anturidatan päivitysväli (minuuteissa)"
         }
       },
       "select_vehicle": {
@@ -32,7 +33,7 @@
       },
       "reauth_confirm": {
         "data": {
-          "description": "Kirjausu uudelleen Volkswagen Connectiin. Varmista että olet hyväksynyt mahdolliset uudet Volkswagen Connect portaalin käyttöehdot (https://www.myvolkswagen.net/) ensin.",
+          "description": "Kirjausu uudelleen Volkswagen Connectiin. Varmista että olet hyväksynyt mahdolliset uudet Volkswagen Connect portaalin käyttöehdot ensin.",
           "username": "Sähköposti",
           "password": "Salasana"
         }

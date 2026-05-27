@@ -13,7 +13,8 @@
           "spin": "S-PIN",
           "name": "Poimenujte svoj avto (privzeto je številka VIN)",
           "debug": "Omogoči celotne dnevnike odpravljanja težav iz API (zahteva omogočeno beleženje odpravljanja težav v konfiguraciji)",
-          "convert": "Izberite, če želite izvesti pretvorbo enot razdalje"
+          "convert": "Izberite, če želite izvesti pretvorbo enot razdalje",
+          "scan_interval": "Interval posodobitve senzorjev (minute)"
         }
       },
       "select_vehicle": {
@@ -32,7 +33,7 @@
       },
       "reauth_confirm": {
         "data": {
-          "description": "Ponovno se prijavite v svoj Volkswagen Connect račun. Poskrbite, da sprejmete morebitno novo licenco EULA v portalu Volkswagen Connect (https://www.myvolkswagen.net/), preden nadaljujete.",
+          "description": "Ponovno se prijavite v svoj Volkswagen Connect račun. Poskrbite, da sprejmete morebitno novo licenco EULA v portalu Volkswagen Connect, preden nadaljujete.",
           "email": "E-pošta",
           "password": "Geslo"
         }

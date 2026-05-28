@@ -1,4 +1,3 @@
-
 pytz
 # volkswagencarnet is bundled at custom_components/volkswagencarnet/volkswagencarnet/
 # (see import_volkswagencarnet.sh); only its third-party dependencies are listed
